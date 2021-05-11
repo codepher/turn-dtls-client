@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,19 +48,15 @@ func main() {
 		cli.BoolFlag{
 			Name: "ping",
 		},
-		cli.StringFlag{
-			Name:  "relay",
-			Value: "",
-			Usage: "",
-		},
 	}
 	app.Action = func(cli *cli.Context) {
-
 		cred := strings.SplitN(cli.String("user"), "=", 2)
 		host := cli.String("host")
 		port := cli.Int("port")
 		realm := cli.String("realm")
+		ping := cli.Bool("ping")
 
+		// 初始化 dtls
 		// Prepare the IP to connect to
 		addr := &net.UDPAddr{IP: net.ParseIP(host), Port: port}
 
@@ -67,6 +64,10 @@ func main() {
 		certificate, genErr := selfsign.GenerateSelfSigned()
 		util.Check(genErr)
 
+		//
+		// Everything below is the pion-DTLS API! Thanks for using it ❤️.
+		//
+		// Prepare the configuration of the DTLS connection
 		config := &dtls.Config{
 			Certificates:         []tls.Certificate{certificate},
 			InsecureSkipVerify:   true,
@@ -78,11 +79,12 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		dtlsConn, err := dtls.DialWithContext(ctx, "udp", addr, config)
-
+		util.Check(err)
 		defer func() {
 			util.Check(dtlsConn.Close())
 		}()
 
+		// 初始化 turn
 		turnServerAddr := fmt.Sprintf("%s:%d", host, port)
 		cfg := &turn.ClientConfig{
 			STUNServerAddr: turnServerAddr,
@@ -123,97 +125,112 @@ func main() {
 		// address assigned on the TURN server.
 		log.Printf("relayed-address=%s", relayConn.LocalAddr().String())
 
-		util.WriteFile("relay.port", relayConn.LocalAddr().String())
+		mappedAddr, err := client.SendBindingRequest()
+		util.Check(err)
+		_, err = relayConn.WriteTo([]byte("Hello world"), mappedAddr)
+		util.Check(err)
+		if !ping {
+			util.WriteFile("relay.port", relayConn.LocalAddr().String())
+			go ReadBind(relayConn, "relayc.port")
+			util.Check(err)
+		} else {
+			util.WriteFile("relayc.port", relayConn.LocalAddr().String())
+			relay, err := os.ReadFile("relay.port")
 
-		if cli.Bool("ping") {
-			err = doPingTest(client, relayConn)
 			if err != nil {
-				fmt.Println("doPingerr", err)
-				panic(err)
+				util.Check(err)
 			}
+			addr := Bind(relayConn, string(relay))
+
+			go pingTo(addr, relayConn)
 		}
+
+		if !ping {
+			buf := make([]byte, 1600)
+			log.Println("relayConn:", relayConn.LocalAddr())
+			for {
+				n, from, readerErr := relayConn.ReadFrom(buf)
+
+				if readerErr != nil {
+					log.Println("readerErr:", readerErr)
+					break
+				}
+				log.Println("relayConn:msg:", string(buf[:n]))
+				log.Println("relayConn:from:", from.String())
+
+				// Echo back
+				if _, readerErr = relayConn.WriteTo(buf[:n], from); readerErr != nil {
+					log.Println("err:", readerErr)
+					break
+				}
+			}
+		} else {
+			buf := make([]byte, 1600)
+			i := 0
+			for {
+				i++
+				n, from, pingerErr := relayConn.ReadFrom(buf)
+				if pingerErr != nil {
+					break
+				}
+
+				msg := string(buf[:n])
+				fmt.Println("get msg", msg)
+				if sentAt, pingerErr := time.Parse(time.RFC3339Nano, msg); pingerErr == nil {
+					rtt := time.Since(sentAt)
+					log.Printf("%d:%d bytes from from %s time=%d ms\n", i, n, from.String(), int(rtt.Seconds()*1000))
+				}
+
+			}
+
+		}
+
 	}
 	err := app.Run(os.Args)
 	if err != nil {
 		fmt.Println("app run error:", err)
 	}
 }
+func pingTo(addr net.Addr, relayConn net.PacketConn) {
 
-func doPingTest(client *turn.Client, relayConn net.PacketConn) error {
-	// Send BindingRequest to learn our external IP
-	mappedAddr, err := client.SendBindingRequest()
-	fmt.Println("mappedAddr", mappedAddr)
-	if err != nil {
-		return err
-	}
-
-	// Set up pinger socket (pingerConn)
-	pingerConn, err := net.ListenPacket("udp4", "0.0.0.0:0")
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if closeErr := pingerConn.Close(); closeErr != nil {
-			panic(closeErr)
-		}
-	}()
-	//Punch a UDP hole for the relayConn by sending a data to the mappedAddr.
-	//This will trigger a TURN client to generate a permission request to the
-	//TURN server. After this, packets from the IP address will be accepted by
-	//the TURN server.
-	_, err = relayConn.WriteTo([]byte("Hello world"), mappedAddr)
-	if err != nil {
-		return err
-	}
-
-	// Start read-loop on pingerConn
-	go func() {
-		buf := make([]byte, 1600)
-		i := 0
-		for {
-			i++
-			n, from, pingerErr := pingerConn.ReadFrom(buf)
-			if pingerErr != nil {
-				break
-			}
-
-			msg := string(buf[:n])
-			if sentAt, pingerErr := time.Parse(time.RFC3339Nano, msg); pingerErr == nil {
-				rtt := time.Since(sentAt)
-				log.Printf("%d:%d bytes from from %s time=%d ms\n", i, n, from.String(), int(rtt.Seconds()*1000))
-			}
-
-		}
-	}()
-	go func() {
-
-		buf := make([]byte, 1600)
-		log.Println("relayConn:", relayConn.LocalAddr())
-		for {
-			n, from, readerErr := relayConn.ReadFrom(buf)
-
-			if readerErr != nil {
-				log.Println("readerErr:", readerErr)
-				break
-			}
-
-			// Echo back
-			if _, readerErr = relayConn.WriteTo(buf[:n], from); readerErr != nil {
-				log.Println("err:", readerErr)
-				break
-			}
-		}
-	}()
-	time.Sleep(500 * time.Millisecond)
-	// Send 10 packets from relayConn to the echo server
 	for i := 0; i < 10; i++ {
 		msg := time.Now().Format(time.RFC3339Nano)
-		_, err = pingerConn.WriteTo([]byte(msg), relayConn.LocalAddr())
-
+		fmt.Println("send msg:", msg)
+		fmt.Println("add:", addr.Network(), addr.String())
+		_, err := relayConn.WriteTo([]byte(msg), addr)
+		if err != nil {
+			panic(err)
+		}
 		// For simplicity, this example does not wait for the pong (reply).
 		// Instead, sleep 1 second.
 		time.Sleep(time.Second)
 	}
+	return
+}
 
-	return nil
+// 动态绑定
+func ReadBind(relayConn net.PacketConn, filename string) {
+	oldRelay := ""
+	for {
+		relay, err := os.ReadFile(filename)
+		util.Check(err)
+
+		if oldRelay != string(relay) {
+			fmt.Println("new relay", string(relay))
+			oldRelay = string(relay)
+			Bind(relayConn, oldRelay)
+		}
+		time.Sleep(time.Second)
+	}
+}
+func Bind(relayConn net.PacketConn, relay string) net.Addr {
+
+	cred := strings.SplitN(relay, ":", 2)
+	port, _ := strconv.Atoi(cred[1])
+	fmt.Println("port", port)
+	add := &net.UDPAddr{IP: net.ParseIP(cred[0]), Port: port}
+	fmt.Println("add", add.String())
+	_, err := relayConn.WriteTo([]byte("Hello world"), add)
+	util.Check(err)
+	return add
 }
